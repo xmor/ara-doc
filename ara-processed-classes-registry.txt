@@ -1,0 +1,768 @@
+# ARA - Registro classi complesse analizzate
+#
+# Scopo: tracciare le classi complesse di ARA gia' sottoposte ad analisi, per evitare
+#        di riproporre le stesse migliorie e per conservare il razionale.
+# Progetto:    /Users/mlago/Documents/workspaces/ara
+# Linee guida: docs/CODING-GUIDELINES.md
+# Creato:      2026-09-26
+#
+# Formato di ogni voce:
+#   <FQCN> - <percorso file> (<righe>)
+#     [dimensione] Modifica - riferimenti riga - regola di CODING-GUIDELINES.md
+#       Giustificazione.
+#
+# Dimensioni: [leggibilita] [prestazioni] [semplificazione] [funzionalita] [correttezza]
+# Le voci marcate [correttezza] indicano difetti eseguibili, non solo debito di leggibilita.
+
+# ---------------------------------------------------------------------------
+# 1
+# ---------------------------------------------------------------------------
+io.ara.runtime.strategy.PlanExecuteStrategy
+  ara-runtime/src/main/java/io/ara/runtime/strategy/PlanExecuteStrategy.java (658 righe)
+
+  [leggibilita] execute() e' a 168 righe (150-317): spezzare nei tre metodi gia'
+    delineati dal codice - pianificazione (193-226), loop di esecuzione (228-281),
+    sintesi (283-316). Tutti cadrebbero sotto le 60 righe. - G1
+    E' l'ultimo metodo da 160-188 righe ancora citato in CODING-GUIDELINES.md:249.
+    Le tre fasi sono gia' separate da righe vuote e non condividono stato oltre
+    il record Run e il Tally.
+
+  [leggibilita] executeStep() e' a 83 righe (330-412), sopra la soglia di split
+    obbligatoria. Estrarre la ricostruzione del contesto isolato: buildStepPrefix
+    (554-592) e' gia' isolato, resta la parte che ricostruisce i messaggi e
+    accumula il risultato. - G1
+    dispatchTool (433-466) e' gia' un metodo separato, quindi l'estrazione e' naturale
+    e non inventa nuove astrazioni.
+
+  [correttezza] replan(): checkTimeout() a 510 sta DENTRO il try aperto a 507, il cui
+    handler catch (Exception e) a 519 converte ExecutionTimeoutException in List.of().
+    Aggiungere una catch specifica per ExecutionTimeoutException prima della 519. - E5, F1
+    Un timeout durante il re-plan viene riportato al chiamante come
+    "Step N of M [...] produced no result" (riga 279), cioe' come fallimento NON-timeout:
+    la diagnosi e' sbagliata. executeStep ha i suoi checkTimeout (356, 378) fuori dal
+    try e li propaga correttamente, quindi la divergenza e' un refuso, non una scelta.
+
+  [correttezza] executeStep(): catch (Exception e) a 373-377 logga e restituisce
+    lastResult, che e' null al primo giro. La causa LLM reale non raggiunge mai il
+    chiamante. Uniformare il comportamento con planning (210) e sintesi (302), che
+    invece la propagano nella stringa di fallimento. - F1
+    Tre gestori fratelli trattano la stessa eccezione in tre modi diversi.
+
+  [funzionalita] plan_execute non esegue ALCUNA governance di costo: zero occorrenze di
+    ReactExecutionSupport.checkBudget e chargeRunBudget nel file, mentre ReActLoop.run
+    le chiama a ogni iterazione (ReActLoop 116-120, 161-166). Aggiungere
+    checkBudget/chargeRunBudget per fase. - nuova funzionalita
+    E' l'unica strategia del package senza alcun controllo di budget. Il costo e' che
+    un piano con 30 step puo' consumare budget illimitato mentre react, reflact e
+    respact sono governati.
+
+  [semplificazione] Cinque copie del blocco "chiamata LLM + InterruptedException ->
+    ripristina flag + Exception -> describeLlmFailure": 202-211 (pianificazione),
+    294-303 (sintesi), 366-377 (step), 508-522 (replan), piu' ReActLoop 137-151.
+    Estrarre llmPhase(Run, List<LlmMessage>, String failurePrefix, Tally). - A3, G1
+    202-211 e 294-303 differiscono SOLO per la lista messaggi e per la stringa prefisso
+    di errore: sono la coppia piu' ovviamente collassabile del file.
+
+  [semplificazione] Il record Run (110-124) e' stato introdotto per sostituire le liste
+    di parametri posizionali (javadoc 103-108) ma e' stato AGGIUNTO ai parametri invece
+    di sostituirli: executeStep ha 5 parametri (330-331), replan ne ha 6 (474-476).
+    Piegare plan e stepResults dentro Run le porta entrambe a 3. - G1
+    plan e stepResults sono stato per-pass e mutati fra le fasi (272, 251), quindi
+    appartengono a Run per costruzione.
+
+  [leggibilita] Nomi della blacklist G2 usati come parametri di metodo: tcr a 434 (tcr
+    e' nominato esplicitamente in CODING-GUIDELINES.md:259), m a 648 (singola lettera
+    fuori da un ciclo), idx usato ben oltre un ciclo breve (494, 578). - G2
+
+  [leggibilita] Il file spiega cosa e perche' ovunque, ma non contiene NESSUNA
+    alternativa scartata. Per il file che e' il target primario del refactor, la voce
+    mancante e' proprio "perche' le tre fasi non sono gia' condivise con la famiglia
+    ReAct" - la prima domanda che un reviewer porra'. - C1, D1
+
+  Nota di asimmetria funzionale: plan_execute ricostruisce il contesto di ogni step in
+  modo isolato (buildStepPrefix, 554-592) invece di usare il MessageBuffer incrementale
+  di ReActLoop. Non trattare i due come interscambiabili senza una decisione esplicita:
+  e' una divergenza deliberata, documentata a 561-564.
+
+# ---------------------------------------------------------------------------
+# 2
+# ---------------------------------------------------------------------------
+io.ara.runtime.strategy.ReactExecutionSupport
+  ara-runtime/src/main/java/io/ara/runtime/strategy/ReactExecutionSupport.java (1175 righe)
+
+  [correttezza] runBounded(): il worker cattura solo RuntimeException (894). Un Throwable
+    o un Error (OOM, StackOverflow) sfugge, salta failure.set(e), ma colpisce comunque
+    il finally { done.countDown(); } (896-898). runBounded vede failure.get() == null e
+    RESTITUISCE result.get() a 917, cioe' null, come successo. - F1
+    Il chiamante (PlanExecuteStrategy:444) lo dereferenzia a 449 e va in NPE, perdendo la
+    causa reale. dispatchBounded non ha il buco perche' la mappa results manca l'indice
+    e il placeholder a 848-849 intercetta il caso.
+
+  [correttezza] 817-819: catch (Exception e) cattura l'InterruptedException consegnata da
+    workers.forEach(Thread::interrupt) (836, 840) e NON ripristina il flag di interrupt.
+    Catturare InterruptedException separatamente e ripristinare il flag. - E5, F1
+    Tipo e stack trace vengono scartati: un'InterruptedException e una NullPointerException
+    producono la stessa stringa "Unexpected error: null".
+
+  [leggibilita] streamAndCollect() e' a 88 righe (1073-1160), sopra la soglia di split
+    obbligatoria. Svolge quattro job separabili: sottoscrizione e forward dei token
+    (1086-1105), attesa bounded con cancel-on-abort (1114-1123), surfacing degli errori
+    (1125-1127), recupero testo vuoto (1131-1144), stima token (1146-1159). La coda
+    1129-1159 e' puro post-processing di una stringa gia' raccolta ed e' l'estrazione
+    naturale. - G1
+
+  [semplificazione] dispatchBounded (784-853) e runBounded (879-918) sono ~35 righe di
+    copy-paste della stessa forma in cinque passi: alloca stato -> avvia thread virtuale
+    -> attesa timed -> interrupt-on-timeout -> raccogli. Differiscono solo in fan-out
+    (N vs 1) e in raccolta (mappa vs riferimento singolo). Fattorizzare lo scheletro
+    comune. - A3
+    La RAGIONE della split e' documentata (862-874: il batch deve ricadere su un
+    placeholder invece di abortire, il singolo no), quindi la split e' giustificata - e'
+    lo scheletro ad essere copiato invece che fattorizzato. Circa 25 righe recuperabili.
+
+  [leggibilita] Otto metodi superano il limite di 3-4 parametri. Il peggiore e'
+    chargeRunBudget a 8 parametri (1017-1019), di cui quattro sono int. Seguono
+    maybeInjectSynthesis (7, 335-337), callLlm (6), completeWithRetry (6),
+    resolveReflectionLlm (6), recordAssistantOutput (6), streamAndCollect (6),
+    checkBudget (6). - G1
+    Il caso piu' netto: PlanExecuteStrategy:103-108 documenta l'introduzione del record
+    Run per esattamente questo motivo, e DispatchContext gia' esiste in questo file
+    (696-699 dichiara esplicitamente di non duplicarlo). Eppure i sei call site
+    LLM/budget passano ancora llm, messages, ctx, deadline, config, taskId a mano.
+
+  [leggibilita] 1175 righe = 3 volte il target di classe (~400, G1) e 2,35 volte la
+    soglia di file (~500). I banner di sezione a 694 e 958 sono l'ammissione della
+    classe stessa di essere tre classi: prompt e sintesi (75-160), logica decisionale
+    (193-352), materializzazione incrementale dei messaggi (387-468), chiamata LLM con
+    deadline e retry (500-692), dispatch tool e streaming (694-918), budget (958-1051).
+    Estrarre per sezione. - G1
+
+  [leggibilita] Nomi della blacklist G2 usati come parametri di metodo, quindi non
+    coperti dall'esenzione per i cicli: tcr a 710, 732, 816, 818, 847, 850; le a 687;
+    ex a 941. Inoltre e a 456 come parametro di metodo, n a 785, f a 913. - G2
+    CODING-GUIDELINES.md:259 nomina tcr, le ed ex esplicitamente.
+
+  [leggibilita] 862 cita docs/analysis/concurrency-hardening.md - la directory non
+    esiste nel tree. Cancellare il riferimento. - H2
+    CODING-GUIDELINES.md:274-280 impone di verificare che il target esista prima di
+    citarlo. Il ragionamento circostante (863-874) soddisfa gia' H1, quindi la
+    cancellazione non costa nulla. Problema sistemico: 25 citazioni repo-wide (anche
+    RuntimeLifecycle.java:24, DefaultResourceRegistry.java:37, SessionStore.java:26).
+
+  [leggibilita] Manca il contratto di thread-safety a livello di classe (javadoc 46-64).
+    MessageBuffer (387-468) e' stato mutabile non sincronizzato e la sua decisione di
+    riuso dipende da un confronto di IDENTITA' (prefixIntact, 443-450): due thread che
+    condividono una istanza produrrebbero silenziosamente una lista messaggi sbagliata,
+    senza eccezione. - E1
+    In pratica e' per-esecuzione (istanziata a ReActLoop.java:70), ma il javadoc
+    (354-386) non lo dice.
+
+  Punti verificati e corretti: nessuna violazione E2. I monitor a 643 e 661 proteggono
+  una handshake di due boolean ed eseguono solo interrupt() non bloccante; la chiamata
+  bloccante llm.complete a 653 e' volutamente FUORI da entrambi. Nessuna attesa non
+  bounded (590, 833, 903, 1116 sono tutte limitate dalla deadline). F3 pulito e
+  attivamente difeso: 489, 741, 746, 797 sono guarded con la relativa ragione - questo
+  file e' l'implementazione di riferimento di F3 nel repo. Il commento 601-627 e' il
+  commento C1 migliore del file: approccio scelto, alternativa scartata (il thread
+  dedicato, respinto per lo Span.makeCurrent() abbandonato e la connessione al provider
+  leakata) e risoluzione della race.
+
+# ---------------------------------------------------------------------------
+# 3
+# ---------------------------------------------------------------------------
+io.ara.runtime.workflow.DataflowScheduler
+  ara-runtime/src/main/java/io/ara/runtime/workflow/DataflowScheduler.java (791 righe)
+
+  [leggibilita] drive() e' a 109 righe (269-377), sopra la soglia di split obbligatoria.
+    Si decompone in sei blocchi gia' separati da righe vuote: submit loop (276-302),
+    attesa della prima completion (308-320), charge (324-332), journaling dei figli
+    mapOver (334-350), scrittura propria (352-358), switch dell'esito (360-375).
+    Estrarre submitReadyNodes(...) e settle(fired, ...). - G1
+
+  [correttezza] 515-517: catch (Exception e) su future.get() (512-514) inghiotte
+    l'InterruptedException SENZA ripristinare il flag e la converte in un normale esito
+    Failed del figlio. Catch dedicata, ripristinare il flag e propagare una
+    cancellazione. - E5, F1
+    Il chiamante continua con il flag pulito e non puo' distinguere "il figlio e'
+    fallito" da "l'intero run e' stato cancellato": l'interrupt non e' ne' rilanciato,
+    ne' ripristinato, ne' convertito. Violazione diretta di E5, che richiede una delle tre.
+
+  [correttezza] Un initialInput null produce un WorkflowResult DI SUCCESSO con zero nodi
+    eseguiti: null fa da sentinel "non ancora pronto". Aggiungere
+    Objects.requireNonNull(initialInput, ...) in run(). - F2
+    Tracciato: 184 mette in pendingSeed; 281-287 fa remove che restituisce null,
+    enablingInput restituisce null a 662-663 (nodo entry senza archi entranti), il nodo
+    viene saltato, inFlight resta 0, e 304-306 restituisce new WorkflowResult(journal,
+    true, null, sharedState). La classe ha gia' l'istinto giusto altrove: 704-709 lancia
+    rumorosamente invece di lasciare che un null composer "legga come non pronto e
+    stalli il nodo per sempre - un hang silenzioso e' la peggior risposta possibile a un
+    bug del chiamante". Lo stesso ragionamento non e' stato applicato all'input.
+
+  [correttezza] 390 completion.take() e 513 future.get() sono non bounded, ma solo
+    quando deadline != null. I costruttori a 2 e 3 argomenti (100, 114) passano
+    deadline = null (135). - E6
+    Il percorso e' quello di default: AgentPipeline:149 usa il costruttore a 2 argomenti,
+    quindi la chiamata agent della pipeline non ha timeout. Una chiamata LLM appesa
+    appende AgentPipeline.run per sempre.
+
+  [correttezza] 53-54 asserisce "single-run, single-use" solo in prosa; nulla lo impone.
+    run() reinizializza solo 2 dei 7 campi mutabili (163-164): occurrence (65), clocks
+    (78), journal (66), sharedState (70), contributions (74) e dead (64) sopravvivono
+    a un secondo run() sulla stessa istanza. Aggiungere un guard oppure spostare i sette
+    campi in un record di stato per-run. - E1, F2
+    Il secondo run eredita journal, stato merged e contatori di occorrenza dalla prima
+    esecuzione, e produce un WorkflowResult il cui journal contiene entrambe le esecuzioni.
+
+  [correttezza] 431 e 507-518: runMapOverChildren gira su un worker del pool e sottomette
+    i figli allo STESSO pool, poi blocca per raccoglierli. - E2, E6
+    run(String, ExecutorService) e' pubblico (138) e accetta qualsiasi executor, e il
+    javadoc pubblico (142-161) non dichiara la precondizione. Un chiamante che passa
+    Executors.newFixedThreadPool(1) va in deadlock deterministico: il task padre occupa
+    l'unico worker, i figli in coda a 487 non girano mai e il padre blocca a 507-518
+    per sempre. La precondizione va nel javadoc pubblico.
+
+  [prestazioni] WorkflowGraph.node(id) e' una scansione lineare (WorkflowGraph.java
+    50-53) e drive la chiama a 337 e 354, charge a 549, replay a 252: n quadrato
+    confronti di stringhe per occorrenza. Aggiungere una Map<String, WorkflowNode> in
+    WorkflowGraph. - B2
+    Il javadoc 49-51 giustifica il design sul presupposto che nessun workflow puntato
+    (decine di nodi) sia "grande abbastanza perche' costi qualcosa di reale". L'invariante
+    regge, ma il costo e' superlineare dove il commento implica lineare, e drive chiama
+    anche enablingInput(id) per nodo per passata, che e' O(archi).
+
+  [leggibilita] runMapOverChildren ha 6 parametri (479-481), di cui pool e deadline sono
+    campi this del chiamante; passarli dentro e' cioe' che rende il metodo static (e
+    quindi verificabilmente privo di stato). applyWrite ne ha 5 (604-605) con coordinate
+    (nodeId, occurrence, sub) che la classe gia' modella in Contribution (82) e Fired
+    (404). Passare il record di coordinate esistente. - G1
+
+  [leggibilita] Il contratto di concorrenza 46-47 e' piu' stretto del codice: i worker
+    valutano anche node.mapOver() (423), spec.elements().apply(output) (425) e
+    spec.workerBody().apply(elementInput) (489), cioe' lambda utente arbitrarie non
+    coperte dal contratto. Una frase risolve. - E1
+
+  [leggibilita] markDead ricorsivo con profondita' illimitata (742-760, 758). Il lavoro
+    totale e' O(archi) come dichiarato (738-740) e termina sui cicli, ma la profondita'
+    di stack e' O(catena piu' lunga di nodi morti): un grafo lineare in cui la deadness
+    cascata percorre tutta la catena ricorsa una volta per nodo. Una worklist renderebbe
+    vera la dichiarazione su tempo e spazio. - B1
+
+  Punti verificati e corretti: il thread-safety contract (44-51) e' dichiarato,
+  comprensivo e corretto - sette collection ordinarie senza lock, confinate al thread di
+  run, con la snapshot di lettura costruita sul thread di controllo prima del submit e
+  resa immutabile a 586. E4 applicato bene, quindi E3 e' vacualmente soddisfatto.
+  Commenti C1 eccellenti: 29-42 (perche' non BSP/superstep, con la riproduzione che ha
+  motivato la scelta), 125-130, 704-709, 734-740, 762-780. Tutti i riferimenti ADR sono
+  accompagnati dalla rationale inline, quindi H1 e' rispettato.
+
+# ---------------------------------------------------------------------------
+# 4
+# ---------------------------------------------------------------------------
+io.ara.runtime.memory.SlidingWindowMemoryManager
+  ara-runtime/src/main/java/io/ara/runtime/memory/SlidingWindowMemoryManager.java (538 righe)
+
+  [correttezza] IndexOutOfBoundsException RAGGIUNGIBILE. evictSummarize a 319 calcola
+    toolCallGroupBounds(ANCHOR_COUNT)[0] con ANCHOR_COUNT == 2, e 497 dereferenzia
+    working.get(start) senza clamp. evictIfNeeded ammette size 2 (guarda a 265,
+    working.size() > 1), quindi working.get(2) su una lista di 2 elementi lancia.
+    Aggiungere in testa a evictSummarize:
+      if (working.size() <= ANCHOR_COUNT * 2) return evictMiddle();
+    replicando il controllo che evictMiddle gia' fa a 288. - F2, G1
+    Trigger: servono tutte e quattro le condizioni - policy == SUMMARIZE,
+    summarizerAgent != null (altrimenti 310-314 degrada a evictMiddle, che e' sicuro),
+    maxTokens > 0 (altrimenti 220 salta l'eviction), e una finestra di 2 entry over
+    budget. L'ultima e' facile: un agente appende il system prompt e poi il task, e il
+    task da solo supera maxTokens. Il commento 315-317 ("la finestra si restringe sempre
+    di almeno una entry") mostra che l'autore stava ragionando su questa classe di
+    failure, ma il guard e' stato messo DOPO il calcolo dei bounds invece che prima.
+    La size 3 e' sicura: toolCallGroupBounds(2) e' in range ed end - start va negativo,
+    cadendo sul guard a 324.
+
+  [prestazioni] Doppia tokenizzazione. charge a 230 usa tokenCounter.count(entryText(e));
+    discharge a 242 RI-ESEGUE il tokenizer vero per sottrarre lo stesso valore. Portare
+    il conteggio per-entry accanto all'entry (o in un array parallelo). - B2
+    Ogni entry evossa viene tokenizzata esattamente due volte. Con un BPE reale
+    (JtokkitTokenCounter, 33-35) e' l'operazione piu' costosa della classe e rende
+    l'eviction O(testo evosso) in lavoro di tokenizer. La dichiarazione "O(1) per append"
+    a 38-42 e' corretta ma limitata all'append: il costo lato discharge non e'
+    dichiarato da nessuna parte.
+
+  [correttezza] recallRelevant fa charge ma non chiama mai evictIfNeeded() (chiamato al
+    solo 220 da add). Aggiungere if (maxTokens > 0) evictIfNeeded(); dopo la 448. - F2
+    Un recall puo' lasciare la finestra permanentemente over budget - ed e' proprio la
+    finestra over budget da cui MessageBuffer.build costruisce la chiamata LLM successiva,
+    e MessageBuffer.build non trimma. Si auto-guarisce al prossimo append, ma solo allora.
+
+  [correttezza] 265: il guard working.size() > 1 implica che una singola entry oltre
+    maxTokens non viene mai evossa e estimatedTokens() resta stabilmente sopra budget per
+    sempre, senza alcun segnale al chiamante. Dichiarare il limite esplicitamente. - D2
+    Inevitabile in principio (non si puo' evellere l'ultima entry e tenere una finestra),
+    ma non e' scritto da nessuna parte.
+
+  [leggibilita] evictRange(0) a 283 rimuove l'indice 0, che recallInsertIndex (455-461)
+    identifica esplicitamente come "il system prompt dell'agente" e la cui esistenza
+    stessa e' motivata dal fatto che perderlo eliminerebbe silenziosamente il catalogo
+    tool da ogni chiamata. Sotto DROP_OLDEST - e sotto DROP_MIDDLE per finestre <= 4
+    (288-289) - quell'invariante non vale. - D2
+    Il codice a valle lo tollera (extractSystemPrompt restituisce "" a 159;
+    MessageBuffer.build cerca la prima system entry a 422-427), quindi non e' un crash:
+    ma i due file hanno assunzioni incompatibili sull'indice 0 e nessuno dei due lo dice.
+
+  [leggibilita] 497-499: quando l'entry 2 e' un risultato "tool", start arretra sulle entry
+    tool consecutive e poi sull'header tool-call precedente. Quindi evictRange
+    (ANCHOR_COUNT) da evictMiddle (291) puo' rimuovere le entry 0 o 1, cioe' le "prime N"
+    che il javadoc di classe (56) promette di preservare. - D2
+    Atomicita' di gruppo e preservazione delle ancore sono in tensione diretta, e
+    l'atomicita' vince in silenzio, senza alcun commento che riconosca lo scambio.
+
+  [leggibilita] Manca il contratto di thread-safety (E1). working e' un ArrayList
+    ordinario e charCount (108), tokenCount (116) e mediaTokenCount (118) sono int mutati
+    in place da charge (228-238) e discharge (240-250). Nessun synchronized, Lock, volatile
+    o AtomicInteger in tutta la classe. Il javadoc (26-73) non menziona la concorrenza.
+    Aggiungere la riga "non thread-safe; confinare a un thread" piu' un RichText finale
+    che lo imponga. - E1
+    Il lato lettura e' isolato (List.copyOf in AbstractMemoryManager.java:53), ma il lato
+    scrittura e' completamente scoperto, e recallRelevant (422) e' un entry point esterno
+    esplicito (un pre-hook RAG, non un append interno al loop).
+
+  [leggibilita] I costruttori a 7, 8 e 9 argomenti (158-159, 164-167, 175-177): quattro
+    overload telescopici, il piu' largo da 9. Un record SlidingWindowOptions servirebbe
+    tutti e quattro. - G1
+    Giustificati dalla compatibilita' all'indietro (ognuno delega al successivo), ma G1
+    chiede un carrier type e qui il carrier manca.
+
+  [leggibilita] ex a 402 e 416 - nome nominato esplicitamente nella blacklist G2
+    (CODING-GUIDELINES.md:259). - G2
+
+  Punti verificati e corretti: nessun metodo supera le 80 righe (il piu' lungo e'
+  evictSummarize a 46); classe a 538 righe, solo 38 oltre la soglia di split dei ~500,
+  il rilievo di dimensione piu' lieve del gruppo. F1, F3, E2 ed E6 puliti: i tre
+  swallow-and-warn (346-353, 399-404, 414-418) sono tutti deliberati, loggano a WARN e
+  sono giustificati in place; ogni log e' a formato costante senza interpolazione di
+  collezioni. I commenti 81-93 e 356-383 sono esempi esemplari di C1/C2: 81-93 dichiara
+  una limitazione nota, l'alternativa scartata con la sua motivazione, e diroti la
+  guardia verso un altro sottosistema invece di fingere che questa classe la gestisca;
+  356-383 registra il design del per-entry-upsert rifiutato, la decisione di rifiutare un
+  deadline con il suo costo, e il bug di igiene degli interrupt che il codice corregge.
+
+# ---------------------------------------------------------------------------
+# 5
+# ---------------------------------------------------------------------------
+io.ara.runtime.scheduler.LocalAgentScheduler
+  ara-runtime/src/main/java/io/ara/runtime/scheduler/LocalAgentScheduler.java (600 righe)
+
+  [prestazioni + E2] Scansione cron DENTRO ConcurrentHashMap.compute. entries.compute a
+    273 (e 114-120 via register, 147-156 via resume) chiama scheduleCron, che a 235
+    esegue CronEvaluator.secondsUntilNext: una scansione minuto-per-minuto fino a
+    MAX_SCAN_MINUTES = (366*4+1)*24*60 = 210.960 iterazioni, ognuna con
+    LocalDateTime.plusMinutes(1) e quattro lookup. Calcolare delaySeconds PRIMA di entrare
+    in compute e passarlo a scheduleCron. - E2
+    Questo contraddice direttamente la giustificazione del file stesso a 68-72 ("Safe to
+    do work inside the remapping function here specifically because scheduleJob/scheduleCron
+    never block - they only register a task with tickExecutor and return"). Non e' I/O
+    quindi nessun carrier viene pinnato, ma E2 (CODING-GUIDELINES.md:164-169) riguarda
+    esplicitamente il lavoro svolto dentro compute: una scansione di centinaia di
+    millisecondi sotto un lock per-id e' lo stesso difetto.
+
+  [prestazioni] Lo stesso percorso colpisce due thread di tipi diversi. Su register e
+    resume la scansione gira sul thread del CHIAMANTE (una richiesta applicativa o HTTP)
+    tenendo il bin monitor per quell'id; sul percorso cron, raggiunto dal task del pool
+    tick a 236-247, gira su un thread tick del pool fisso dimensionato
+    max(2, availableProcessors()) (102-104) - cioe' esattamente il fallimento "uno
+    scheduler che fa digiunare i propri tick" che la nota P2 (41-50) dichiara di aver
+    eliminato. Un'espressione come "0 0 29 2 *" esaurisce la scansione per anni di minuti
+    a ogni singolo tick. - E7
+
+  [correttezza] Manca completamente lo stato di ciclo di vita. Aggiungere
+    private volatile boolean stopped; controllato in cima a register e resume, con
+    IllegalStateException("scheduler already stopped"). - F2
+    stop() (207-214) cancella ogni future e chiama shutdownNow() su entrambi gli executor,
+    ma lascia entries popolata e non registra che gli executor sono morti.
+    (a) list() dopo stop riporta ogni schedule come in pausa, perche' withLiveActiveFlag
+    (193-199) deriva running da e.future() != null e i future cancellati sono ancora
+    non-null: la mappa e' stale e non etichettata.
+    (b) register o resume dopo stop lancia una RejectedExecutionException grezza da dentro
+    la funzione di rimappatura (CHM lascia la mappatura invariata su eccezione, quindi la
+    entry conserva silenziosamente il suo vecchio valore e il log.info a 121-122 non gira
+    mai) - un fallimento opaco senza alcun riferimento al fatto che lo scheduler e' fermo.
+
+  [correttezza] parseField (523-533) ritorna null per il wildcard, ma un campo fatto solo
+    di separatori produce un insieme VUOTO in silenzio: ",".split(",") restituisce un
+    array di lunghezza zero (Java scarta le stringhe vuote finali), il corpo del ciclo non
+    gira mai, e 526/532 restituiscono un HashSet vuoto. Fallire al parse. - F2
+    secondsUntilNext la tratta come "un campo che non matcha mai" e scansiona tutti i
+    210.960 minuti prima di lanciare IllegalStateException (500). Un'espressione
+    malformata dovrebbe fallire al parse, non dopo una scansione di centinaia di
+    millisecondi. Il check esplicito a 528-529 (if (part.isBlank()) throw) mostra che
+    l'intento c'era: e' semplicemente irraggiungibile per il caso "solo separatori".
+
+  [correttezza] Il commento 448-450 afferma che scansionare ~4 anni e 1 giorno garantisce
+    di raggiungere il prossimo "Feb 29". Non e' vero: 2100 non e' un anno bisestile
+    (divisibile per 100, non per 400), quindi un run di "0 0 29 2 *" che parte dopo il
+    2096-03-01 non ha alcun Feb 29 per circa 8 anni e la scansione manca, lanciando
+    l'IllegalStateException che 460-461 documenta come "non dovrebbe accadere per alcuna
+    espressione ben formata". - D2
+    Latente, non triggerabile oggi, ma l'affermazione assoluta del commento e' falsa. Il
+    fix migliore e' un advance del calendario vero e proprio invece di una scansione alla
+    cieca; il fix minimo e' un limite 4 volte piu' grande, che rende vera la frase.
+
+  [correttezza/E7] notifyFire (318 -> 384-391) esegue un listener fornito dal chiamante
+    sul thread tick. Con un pool di max(2, cores) condiviso da ogni schedule, un listener
+    lento ritarda i trigger di schedule non correlati - la stessa classe di problema che
+    la nota P2 credeva di aver risolto per gli agenti. - E7
+    Il contratto dell'interfaccia lo avverte gia' ("keep it lightweight and non-blocking,
+    draining a tick thread delays every other schedule's trigger",
+    ScheduleExecutionListener.java:19-20), ma il vincolo merita di essere ripetuto dove
+    viene applicato.
+
+  [leggibilita] CronEvaluator (446-599, 154 righe) e' un parser autocontenuto e
+    indipendentemente testabile, con un solo accoppiamento: quattro chiamate a Builder.
+    Estrazione naturale in un file proprio. - G1
+    Il file a 600 righe supera la soglia di split dei ~500 di G1.
+
+  [correttezza/E5] onFireOutcome (359-376) riceve un Throwable ex da whenComplete e non
+    controlla mai se sia un'InterruptedException: concatena solo ex.getMessage() a 365.
+    Aggiungere il controllo e una frase che spieghi perche' oggi il flag non puo'
+    trapelare. - E5
+    Mitigato, non violato: agentExecutor e' newVirtualThreadPerTaskExecutor() (105), quindi
+    il callback gira su un thread virtuale fresco che muore subito dopo. L'asimmetria
+    rispetto a DataflowScheduler:496-501, che documenta esplicitamente la stessa
+    mitigazione, e' l'odore. Inoltre 326 scarta lo stage derivato: un throw dentro
+    onFireOutcome completa quello stage eccezionalmente e si perde silenziosamente.
+
+  [leggibilita] notifyFire e due log.debug non guarded a 319 e 372. - F3
+    Argomenti economici e {} parameterizzati, quindi lievi, ma il resto del file sceglie
+    il livello con cura (info per il ciclo di vita, warn per il degrado gestito, error
+    per l'attenzione richiesta) e inputTemplate non viene mai loggato, il che e' la
+    disciplina F3 corretta.
+
+  Punti verificati e corretti: nessuna violazione E6 - nessuna .get(), .join(), .await(),
+  .take() o .poll() nel file, e ScheduledFuture.cancel(false) e' non bloccante per
+  contratto. Nessun monitor e quindi nessun carrier pinnato; E3 e' vacualmente soddisfatto
+  (una mappa, una chiave, nessun annidamento). F1 pulito: tutti e cinque i catch loggano
+  senza deglutire, e safeFire (308-315) e' un esempio da manuale - cattura Throwable,
+  logga a ERROR con l'id dello schedule, e la nota P1 (286-299) spiega esattamente la
+  trappola di ScheduledThreadPoolExecutor che previene. Le note P1 e P2 (41-72) sono la
+  documentazione "why" migliore del gruppo: ognuna nomina il fallimento, il trigger, la
+  conseguenza concreta e il fix, piu' la condizione sotto la quale il fix e' sicuro.
+
+# ---------------------------------------------------------------------------
+# 6
+# ---------------------------------------------------------------------------
+io.ara.runtime.agent.SessionManager
+  ara-runtime/src/main/java/io/ara/runtime/agent/SessionManager.java (504 righe)
+
+  [correttezza] evictIfStillIdle(): wiring().close() gira DENTRO session.executionLock().
+    tryLock a 366, takeForClose + close a 373, unlock a 376. Spostare la close fuori dal
+    try: a 373 serve solo sessions.remove(key, entry), cioe' la mutazione di stato. - E2
+    E' la stessa I/O che il javadoc 325-327 dichiara apertamente ("can do real teardown
+    I/O (closing an MCP connection)"). E2 prescrive "Do the I/O first, then take the lock
+    only for the state mutation" e osserva che un ReentrantLock tenuto su I/O "serialises
+    every other thread that needs it": qui il contender e' l'esecutore del task su quella
+    sessione, che resta bloccato per tutta la durata di un teardown MCP lento.
+    Il fratello DefaultResourceRegistry ha gia' corretto lo stesso identico difetto in
+    P5/U17 - "Closing is never done under this lock" (50-58) - e non esegue mai
+    Lease::evict sotto entry.lock (272-281). SessionManager e' il sibling rimasto indietro.
+
+  [correttezza] evictStale(): Thread.ofVirtual().start() una volta per chiave, senza tetto.
+    346-348 - E7
+    E7: "any per-item thread spawn ... has a configurable concurrency ceiling or a bounded
+    queue". Una passata che trova N sessioni scadute avvia N thread virtuali, ognuno dei
+    quali sta per fare I/O di teardown bloccante. Il javadoc 323-333 giustifica la
+    CONCORRENZA fra sessioni diverse ma non ne considera il NUMERO, che e' l'altra meta'
+    della regola. E' l'unico fan-out per elemento dentro un ciclo su collezione in
+    ara-runtime: ReactExecutionSupport:814 e' limitato dal numero di tool call,
+    DefaultResourceRegistry:272 e' un thread per drain programmato.
+    Il fallimento da evitare resta quello che il javadoc stesso descrive (una close
+    bloccata disabiliterebbe il reclamation per la vita della JVM): il rimedio e' un
+    executor condiviso con concorrenza limitata, non reintrodurre il seriale inline.
+
+  [correttezza] getOrCreate(): il while (true) a 145 non e' bounded. - E6
+    E6: "every blocking wait carries a timeout derived from the task deadline". Qui non
+    esiste un deadline da cui derivarlo: la classe non ne accetta nessuno, mentre i suoi
+    pari (Workflow:86, DataflowScheduler) ne ricevono un Instant. Ogni iterazione esegue
+    un sessionOrBuild completo, che puo' includere wiringFactory.build, quindi una
+    connessione MCP reale. Se un invalidate / shutdown / sweeper concorrente vince sempre
+    la corsa, il ciclo ricostruisce all'infinito: lavoro non limitato e attesa non
+    limitata, senza un solo controllo. Mettere un tetto ai tentativi (o un deadline) e
+    fallire con una diagnostica che nomini la sessione.
+
+  [correttezza] takeForClose(): buildLock.lock() a 486 e' un'attesa non bounded e non
+    interruptible, ed e' raggiunta da shutdown(). - E6, E5
+    removeAndClose (393-397) la chiama sia da invalidate() sia dal drain loop di shutdown()
+    (291-293), una sessione per volta. Se il wiringFactory.build in corso si impianta,
+    shutdown() si blocca per sempre e sweeper.shutdownNow() a 290 non lo sblocca: l'interrupt
+    non viene neppure tentato. La classe usa gia' la forma limitata altrove -
+    executionLock.tryLock() a 366 - quindi il rimedio e' applicare la stessa disciplina a
+    buildLock: lockInterruptibly, oppure tryLock con timeout e comportamento al timeout
+    dichiarato.
+
+  [correttezza] getOrCreate(): re-verify a 159 e touch() a 163 non sono atomici. - E2
+    Stessa finestra gia' trattata da P5/U15 e P5/U16, quindi merita attenzione proprio
+    perche' il file ha gia' imparato questa lezione. Se la sessione era gia' idle oltre il
+    TTL, fra il controllo identitario e il touch lo sweeper puo' completare
+    evictIfStillIdle: tryLock a 366 riesce (nessun task in corso), chiude il wiring e
+    rimuove l'entry; getOrCreate tocca allora un entry gia' staccata e restituisce una
+    sessione con il wiring chiuso. Il caller non copre il caso: AgentInstance:255
+    acquisisce executionLock solo a 367, dopo tutta la prologo di execute. Inversione
+    gratuita: toccare prima, ri-verificare dopo.
+
+  [correttezza] evictIfStillIdle() e' l'unico punto del file che annida due lock:
+    executionLock a 366 e, transitivamente, buildLock via takeForClose a 373. - E3
+    E3 pretende l'ordine dichiarato in entrambi i punti di acquisizione. Oggi non c'e'
+    inversione (sessionOrBuild prende solo buildLock) e quindi nessun deadlock: il rischio
+    concreto e' che il prossimo refactor introduca l'ordine opposto senza saperlo. Un
+    commento di checklist (C4) lo dichiara; spostare close e takeForClose fuori dal try,
+    come sopra, dissolve l'annidamento invece di documentarlo.
+
+  [semplificazione] L'espressione entry.takeForClose().ifPresent(s -> s.wiring().close())
+    compare identica in due punti: 373 (evictIfStillIdle) e 396 (removeAndClose). Estrarre
+    closeEntry(SessionEntry) e chiamarla da entrambi. - A3, G1
+    Piccolo ma sicuro: la regola del single-owner (381-391) resta interamente dentro
+    takeForClose(), quindi l'estrazione non sposta dove viene deciso chi chiude, solo dove
+    viene scritto il codice. Sono le uniche due occorrenze (grep: 2).
+    Cosa NON collassare, e perche' (D1): i tre teardown restano tre. getOrCreate:173
+    rimuove l'entry SENZA chiudere, e deve restare cosi' - in quel caso chi ha rimosso
+    l'entry dalla mappa possiede gia' la close, e chiamare takeForClose qui aprirebbe una
+    seconda, violando la regola che il file stesso dichiara. evictIfStillIdle inoltre
+    deve stare sotto executionLock mentre removeAndClose no. Un unico teardown
+    "chiamabile dai tre" avrebbe cancellato la differenza di I-O-under-lock che e'
+    esattamente il difetto segnalato sopra: tenere i tre percorsi distinti e' la correzione,
+    non il debito.
+
+  [leggibilita] listActive() (245-260) restituisce List<Map<String, Object>> con cinque
+    chiavi stringa ("session_id", "turn_count", "last_accessed_at", "ttl_remaining_ms",
+    "state"); un record SessionStatus(...) le rende controllate dal compilatore. - B2, G2
+    B2 chiede di preoccuparsi della struttura dati, ed e' esattamente la struttura dati a
+    essere debole qui: il contratto di un endpoint di osservabilita' e' una mappa che
+    nessun compilatore verifica e che AgentInstance:624 riesporta invariata. Trade-off
+    dichiarato (D2): e' un API pubblico, la change e' breaking e va coordinata - per
+    questo resta una proposta e non una rifinitura.
+
+  [prestazioni] Micro, a costo di complessita' zero: listActive() rilegge entry.session()
+    tre volte (248, 254, 257), tre letture volatile per entry viva piu' un null check
+    ridondante; getOrCreate chiama sessionId.value() tre volte (146, 159, 173). - A1
+    Bastano due variabili locali. Non e' un hot path e non lo diventera (D2): si cita per
+    completezza, non perche' serva. Rientra nel "A1 vs hot-path care" delle linee guida
+    (288-291): e' una vittoria a complessita' zero, quindi dentro A1, non un baratto.
+
+  [leggibilita] I tag "U24", "P5/U15", "P5/U16", "N1" (115, 150, 191, 206, 231, 248, 265,
+    286, 314, 323, 341, 352, 386, 405, 411) sono etichette, non spiegazioni: chi non ha il
+    corpus degli ADR non puo' sapere che cos'erano U24 o P5. - H1, H2
+    docs/ non contiene alcuna directory adr/, quindi H2 vieta esplicitamente questa forma
+    di citazione. La maggior parte delle occorrenze e' pero' gia' conforme a H1, perche'
+    la spiegazione c'e' e l'ADR e' solo in aggiunta: il caso peggiore e' 112, "ADR-039
+    sez. 1", puntatore puro, e i tag usati come soggetto di frase. Riscrivere i tag come
+    periodi ("prima di U24 questo veniva fatto cosi'...") e tenere la data come data.
+
+  Nessuna voce [funzionalita], deliberatamente. Il difetto che il javadoc 325-330 pavida
+  di piu' - una close piantata che disabiliterebbe il reclamation per la vita della JVM -
+  e' invisibile in modo silenzioso: sweep() (301-307) logga solo se la task solleva, e una
+  close lenta non solleva. Un contatore o un log di sweep eliminerebbe il cecchio. Non e'
+  pero' una proposta: e' un knob nuovo, e A2 chiede "who asked for this, and what real case
+  uses it?" - non c'e' un secondo consumatore reale, ed E7 nel frattempo vieta l'altra meta'
+  (tetto di concorrenza) che lo renderebbe sicuro. Va trattato insieme alla voce E7 sopra,
+  come una scelta, non aggiunto a fianco. Lo stesso vale per un deadline su getOrCreate:
+  e' gia' dentro la voce E6, dove e' una correzione di una regione rotta e non una
+  funzionalita' (D2). Quello che resta e' che ogni voce di questa entry e' una correzione
+  di una violazione verificabile: aggiungere funzionalita' a questa classe oggi non
+  produrrebbe niente che la rendesse migliore.
+
+  Punti verificati, nessuna violazione e niente da proporre (D1): il contratto di
+  thread-safety (E1) c'e' ed e' esatto - SessionEntry dichiara i campi volatile e il lock
+  che li governa (399-437), ed e' l'unico tipo mutabile del file. La separazione
+  computeIfAbsent / puntatore segnaposto (145-149) e' la risposta corretta a E2:
+  ConcurrentHashMap non espone un lock sostituibile, e la nota 121-129 lo dichiara invece
+  di fingere il contrario. activeSessionCount() che conta i placeholder (206-214) e' uno
+  scambio dichiarato, non un difetto. takeForClose() chiude esattamente una volta anche
+  quando il build era in volo (455-492). Nessuno swallow: sweep() (301-307) logga a WARN e
+  non lascia spegnere la scheduleAtFixedRate. Nessun InterruptedException nel file, quindi
+  E5 non ha oggetto; nessun .get()/.join()/.await() bloccante oltre le lock gia' citate.
+
+# ---------------------------------------------------------------------------
+# 7
+# ---------------------------------------------------------------------------
+io.ara.adapters.llm.chatjimmy.ChatJimmyLlmClient
+  ara-adapters/src/main/java/io/ara/adapters/llm/chatjimmy/ChatJimmyLlmClient.java (780 righe)
+
+  Scelta: e' la piu' grande classe di produzione del repo ancora assente dal registro
+  (AgentPipeline, AraRuntime e AgentInstance sono gia' nella sezione "candidati di riserva"
+  in coda al file, quindi esclusi dalla regola di non duplicazione). Copre 5 responsabilita'
+  in un solo file: trasporto HTTP con proxy e Basic auth, traduzione della conversazione
+  ARA nel formato chatjimmy, parsing della risposta, state machine dello streaming e
+  prompt/parse dei marcatori testuali dei tool. 780 righe, oltre il limite di G1.
+
+  [correttezza] pumpStream() a 541 decodifica i byte con new String(chunk, 0, n, UTF_8)
+    una volta per ogni chunk di rete: un carattere multi-byte spezzato fra due chunk
+    produce un U+FFFD, cioe' mojibake nel testo riprodotto all'utente. Sostituire con un
+    InputStreamReader/CharsetDecoder che tenga i byte in residuo, oppure usare
+    BodyHandlers.ofLines(). - B2, F4
+    E' l'unico punto dell'intero repo che decodifica a mano da ofInputStream (grep
+    confermato), quindi l'unico dove il difetto puo' vivere. Il test
+    stream_emits_text_tokens_and_drops_think_and_stats_spans (ChatJimmyLlmClientTest
+    256-282) usa solo "Hello, world!" e finisce le stringhe su confini che il test
+    controlla: il caso multi-byte non e' coperto, ed e' esattamente il caso che
+    fallirebbe. Per un adapter verso un sito di chat generico l'output non-ASCII e' la
+    norma, non l'eccezione.
+
+  [correttezza] Nessun timeout sulla LETTURA del body in streaming: il timeout della
+    richiesta (433) copre l'ottenimento della risposta, non il consumo dello stream, e
+    pumpStream() non ha nessun deadline. Aggiungere un deadline derivato da timeout e
+    chiudere il publisher alla scadenza. - E6
+    Un upstream che invia gli header e poi si blocca tiene vivo per sempre un thread
+    virtuale e una connessione, e SubmissionPublisher non ha hook per fermarlo: lo
+    stream() (231-236) ha gia' restituito il publisher al chiamante, quindi dal punto di
+    vista dell'API la richiesta e' riuscita e nessuno la chiude piu'. E' la stessa classe
+    di attese non bounded gia' segnalata nelle voci 5 e 6, qui senza nessuna lock che
+    renda il danno peggiore.
+
+  [correttezza] runStream() non chiude mai response.body() (509-516): niente
+    try-with-resources, e i rami di errore (512) e IOException (520) abbandonano lo
+    stream aperto. - F1
+    Nel percorso felice la lettura fino a EOF restituisce la connessione al pool, ma i
+    due rami di fallimento no, e sono proprio quelli che si vedono in produzione.
+
+  [correttezza] parseToolCalls() a 661-663 scarta l'eccezione e restituisce List.of():
+    un blocco <tool_calls> malformato diventa "nessuna tool call" e il ReAct loop
+    prosegue come se il modello avesse risposto in testo. - F1
+    Stessa forma in parseArgumentsOrEmpty() (372-374) e in tryParseJson() (617-619):
+    tre catch (Exception e) senza log, senza contesto e senza rilancio, in un file che
+    non ha alcun Logger. F1 vieta esplicitamente catch (Exception ignored). Aggiungere
+    SLF4J (lo usano gia' AbstractLangChain4jLlmClient, ToolConversionUtils e McpAraTool
+    nello stesso modulo) e loggare a WARN il testo troncato: un tool call scartato in
+    silenzio e' il tipo di fallimento piu' difficile da diagnosticare in produzione.
+
+  [correttezza] runStream() ha un catch (Exception ex) finale a 523 che etichetta come
+    errore di rete qualunque RuntimeException, NPE del client compreso. Separare
+    catch (RuntimeException) e riportare il tipo corretto. - F1
+    Oggi un difetto del client arriva al chiamante come LlmException.networkError, che
+    FailoverLlmClient puo' trattare come guasto dell'upstream e quindi ritentare: un bug
+    locale diventa un ciclo di retry.
+
+  [funzionalita] stream() a 234 crea un thread virtuale per ogni chiamata, senza tetto,
+    senza nome e senza join: E7 chiede un ceiling di concorrenza o una coda bounded e il
+    riuso di un executor condiviso quando la durata lo consente. Aggiungere un Executor
+    posseduto dal client, costruito una volta, con timeout come ceiling, e chiuso da
+    close(). - E7
+    Il soffitto naturale e' gia' scritto: il campo timeout (132). Oggi un agente che
+    emette molte richieste di streaming in parallelo apre un thread per richiesta senza
+    alcun limite, mentre il resto del file mantiene un timeout per ogni operazione.
+
+  [correttezza] listModels() a 260 inietta un model id che l'upstream non offre:
+    if (!ids.contains(DEFAULT_MODEL)) ids.add(0, DEFAULT_MODEL). Il catalogo restituito
+    puo' contenere un modello che non esiste. Rimuovere l'iniezione, o dichiararla
+    esplicitamente come un default suggerito e non come un fatto. - D2, B4
+    E' incoerente con i 25 righe di ragionamento di mapHttpError (463-471), che spiegano
+    con cura perche' un 404 NON va riportato come "model not found" perche' il lettore
+    cerchi la causa vera: qui si pubblicizza come disponibili proprio i modelli di cui
+    non si e' verificata l'esistenza, cosi' un 404 rimanda a cercare il difetto che
+    questo metodo ha appena commesso.
+
+  [semplificazione] Builder.maxTokens() (735) e il campo defaultMaxTokens (130) non
+    hanno un caller reale: il ramo else di applyCallParameters (337-341), unico lettore
+    del campo, e' irraggiungibile in produzione. Rimuovere il ramo e il setter, o
+    dichiarare che il ramo serve solo ai test. - A2, A4
+    Verificato: ogni call site di produzione passa un context non null, e il bridge
+    deprecato dell'interfaccia costruisce LlmCallContext.from(config) (LlmClient
+    44-45), quindi nessuno arriva mai con null. Da notare con onesta': NON e' un bug di
+    valore sbagliato. maxOutputTokens e' un int non nullabile e CallParameterUtils
+    38-41 documenta che applicarlo sempre e' intenzionale (ReactStrategy ne ha bisogno
+    per la proiezione del budget di costo). Il difetto e' il knob morto e il contratto
+    scritto male, non il valore inviato.
+
+  [leggibilita] Il javadoc di applyCallParameters (320-325) promette che "un valore che
+    nessuna delle due parti ha impostato e' semplicemente omesso" e dichiara di
+    "rispecchiare CallParameterUtils": nel ramo else il valore viene invece sostituito
+    con il default del client, e il perche' della divergenza (maxTokens applicato
+    sempre, per il motivo di CallParameterUtils 38-41) non e' scritto da nessuna
+    parte. - C1, C5, D1
+    E' la C1 mancante: il file spiega bene il perche' delle cose sbagliate (407, 404,
+    header di evasione dal rate limiting) e lascia senza spiegazione proprio la scelta
+    che un reviewer chiederebbe per prima, cioe' perche' questo adapter non riusa
+    CallParameterUtils. La risposta (non puo' riusarlo: quello scrive su
+    ChatRequest.Builder di LangChain4j, qui si scrive su un ObjectNode) merita di stare
+    nel commento.
+
+  [leggibilita] Il javadoc di classe annuncia la forma del payload come
+    "{messages, chatOptions, attachment}" (41-44) ma checkNoMedia (312-318) rifiuta
+    qualunque media, quindi attachment e' sempre null (308) e non ha un solo produttore
+    in tutto il file. Correggere il javadoc: o dire che lo slot esiste ed e'
+    inutilizzato, o toglierlo dalla forma descritta. - H1, C1
+    Non si propone di implementare gli allegati: A2 dice di non aggiungere cio' che non
+    e' stato chiesto, e fallire pulito invece di caricare file e' una scelta legittima.
+    Il difetto e' solo che la descrizione del contratto non corrisponde al codice.
+
+  [leggibilita] drainBuffer() (547-579) duplica letteralmente il ramo "il marcatore di
+    chiusura non e' ancora arrivato" a 569 e a 576. Estrarre
+    consumeSpan(buffer, startMarker, endMarker), usato due volte. - A3, B1
+    Sono due righe identiche piu' il delete e il continue; l'estrazione e' letterale,
+    non un'astrazione inventata, e lascia drainBuffer con un solo ciclo e un solo tipo
+    di marcatura da gestire.
+
+  [leggibilita] Metodi privati che non toccano lo stato dell'istanza dichiarati
+    non-static: nullToEmpty (351), parseArgumentsOrEmpty (369), tryParseJson (614),
+    intField (695), doubleField (699). Dichiararli static. - B3
+    MAPPER (123) e' static e i metodi non hanno altri riferimenti a this: la firma
+    dichiara una dipendenza dallo stato del client che non esiste.
+
+  [leggibilita] Import inutilizzati e wildcard: com.sun.net.httpserver.HttpServer (26)
+    e' importato e mai usato (unica occorrenza nel file) ed e' un API interno com.sun
+    che non ha ragione di stare in un client HTTP; java.util.* (15) e' un wildcard in
+    un file che per il resto importa una classe alla volta. - B3, G2
+    Il primo e' il piu' insidioso: HttpServer e' l'API per montare un server di test, e
+    la sua presenza in un adapter client suggerisce a un lettore un test server che qui
+    non esiste.
+
+  [leggibilita] 780 righe con 5 responsabilita' distinte, oltre il limite di G1 (~400) e
+    oltre la soglia di ~500 che rende il file candidato a uno split. Proposta
+    conservativa: estrarre ChatJimmyStreamParser con pumpStream/drainBuffer/
+    earliestIndex (536-585, ~50 righe), che e' l'unico blocco con una state machine
+    propria, nessuna dipendenza dallo stato del client e un difetto di codifica
+    isolato; il resto (HTTP, traduzione richiesta, parsing risposta, Builder) resta
+    com'e' e resta sotto ~700 righe. - G1, B1, B2
+    Non si propone di spostare il Builder in un file separato come si farebbe con
+    AraRuntime.Builder: li' la compatibilita' di sorgente imporrebbe di lasciare il
+    nome annidato, qui non c'e' lo stesso vincolo e il Builder (709-779) e' gia'
+    autonomo.
+
+  Nota di onesta' (D3): questa voce non tocca i temi gia' coperti dalle voci
+  precedenti (budget di costo, attese su SessionManager, lock di
+  DefaultResourceRegistry). L'analisi e' stata fatta per lettura e grep: non ho
+  eseguito mvn verify ne i test, quindi i difetti di runtime sopra sono dedotti dal
+  codice e vanno confermati con un test offline che li riproduca - in particolare lo
+  split UTF-8 a cavallo di due chunk, che si scrive in poche righe con lo
+  StubLlmProvider gia' presente nel test esistente.
+
+# ---------------------------------------------------------------------------
+# Analizzate ma NON registrate (candidati di riserva)
+# ---------------------------------------------------------------------------
+# io.ara.runtime.pipeline.AgentPipeline (661) - nessun timeout sul percorso di
+#   esecuzione (149 -> DataflowScheduler:390); FsmBuilder.build (630-659) valida
+#   initial ma non i target delle transition (errore differito a runtime, 302-305),
+#   non i terminal (ignorati silenziosamente) e non le fonti delle transition
+#   (scartate silenziosamente -> ordine di esecuzione sbagliato); il commento
+#   180-185 che giustifica l'accumulatore non sincronizzato poggia su una
+#   affermazione falsificabile ("nessuno step ha piu' di un predecessore vivo") -
+#   la vera ragione e' che ogni selector emesso restituisce al massimo un target;
+#   stepOrder.indexOf(target) a 253 per target per step per run, per una decisione
+#   che il file precalcola altrove apposta.
+# io.ara.runtime.AraRuntime (1382) - la classe me' documentata del repo sul fronte
+#   della concorrenza, quindi meno fruttifera. synchronized (this) a 381 tiene il
+#   monitor mentre acquisisce un secondo lock (lifecycle a 318): nessuna I/O oggi,
+#   ma niente impedisce a factory.create di acquisirla; javadoc pendente a 710
+#   ({@link Builder#validate()} non esiste, la validazione e' in RuntimeAssembler);
+#   parametro v a 1294-1295; userScopes non validato a 415 mentre i suoi tre fratelli
+#   lo sono; agentProvider.configs() a 187 valutato prima del primo controllo di deadline.
+# io.ara.runtime.agent.AgentInstance (894) - shutdown() a 705-707 e' un metodo
+#   pubblico morto, non dichiarato da alcuna interfaccia e senza caller in main o
+#   test: duplica il drain di terminate() senza impostare il flag closed, per cui
+#   l'agente accetta ancora execute() le cui sessioni verranno ricreate
+#   silenziosamente contro un SessionManager gia' chiuso. activeSessions() a 623-625
+#   e' una delega pubblica morta che espone List<Map<String,Object>> con chiavi
+#   stringy. lockInterruptibly() a 373 e' un'attesa non bounded (E6) e l'alternativa
+#   limitata e' proprio quella scartata e mai menzionata: tryLock(timeout, unit).
+#   Nota di non-duplicazione: SessionManager e' ora registrato come voce 6, che
+#   contiene gia' E2 (close sotto executionLock), E6 (attese non bounded su buildLock) e
+#   E7 (fan-out di thread virtuali senza tetto) - non riproporle qui. La voce 6 tratta
+#   anche le chiavi stringy, ma per listActive() (245-260); resta proprio questo
+#   difetto il fatto che activeSessions() (623-625) ne e' una delega pubblica morta.
