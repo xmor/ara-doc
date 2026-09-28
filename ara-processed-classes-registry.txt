@@ -734,6 +734,157 @@ io.ara.adapters.llm.chatjimmy.ChatJimmyLlmClient
   StubLlmProvider gia' presente nel test esistente.
 
 # ---------------------------------------------------------------------------
+# 8
+# ---------------------------------------------------------------------------
+io.ara.runtime.factory.AgentFactory
+  ara-runtime/src/main/java/io/ara/runtime/factory/AgentFactory.java (672 righe)
+
+  Scelta: e' la piu' grande classe di ara-runtime ancora assente dal registro dopo
+  la voce 7: le tre piu' grandi del modulo (AraRuntime 1382, ReactExecutionSupport
+  1175, AgentInstance 894) sono gia' nella sezione "candidati di riserva" in coda al
+  file, quindi esclusi. E' anche la seconda piu' grande classe di produzione del repo
+  dopo ChatJimmyLlmClient. Ha un valore aggiunto rispetto alle voci precedenti: e' il
+  nodo in cui ogni AraAgent nasce e muore, quindi l'unico posto dove una validazione
+  mancante diventa un guasto che si ripete su ogni agente successivo, e dove un
+  errore di bookkeeping lascia un agente distrutto ma ancora registrato.
+
+  [correttezza] Builder.build() (654-663) non verifica mai che defaultLlmClientId
+    sia fra gli id registrati: controlla che llmClientRegistry non sia vuota e che
+    quattro campi non siano nulli, ma non che il default sia risolvibile. Il
+    controllo gemello esiste gia' un livello piu' in alto, in RuntimeAssembler.validate
+    (133-138). Aggiungere in build() lo stesso controllo con lo stesso messaggio,
+    che nomina gia' il rimedio ("register it via llmClient(id, client) or fix
+    defaultLlmClient(id)"). - F2, A4
+    Finora l'errore emerge alla prima sessione di ogni agente, da
+    DefaultWiringFactory.leaseTransport (206-212), e arriva con un messaggio che
+    accusa l'agente: "No LlmClient found for transportId='X' and no default
+    registered". Chi legge quel messaggio guarda la config dell'agente, non il
+    builder della factory. Peggio: il default non e' mai consultato quando
+    l'agente ha un transportId proprio gia' pubblicato, quindi un refuso in
+    defaultLlmClient(...) resta invisibile per tutti quegli agenti e si manifesta
+    solo su quelli che hanno gia' un problema diverso.
+
+  [correttezza] Builder.llmClient(LlmClient) (502-505) scrive l'id "default" ma
+    NON imposta defaultLlmClientId, che resta quello corrente: dopo un
+    defaultLlmClient("altro") esplicito, il client appena registrato con l'overload
+    a un argomento non diventa il default, in contrasto con il nome del metodo e
+    con AraRuntime.Builder.llmClient (1032-1042), che lo imposta esplicitamente
+    ("regardless of what was registered before"). Allineare i due builder, o
+    cancellare l'overload a un argomento lasciando solo llmClient(id, client) che
+    non ha questa ambigrita'. - B4, F2
+    I due builder hanno lo stesso nome, lo stesso overload a un argomento e la
+    stessa semantica dichiarata, ma solo AraRuntime.Builder esegue il testo del
+    proprio javadoc: la divergenza e' silenziosa e l'agente usa per mesi il
+    client precedente senza che nulla lo segnali.
+
+  [correttezza] destroyPermanently (457-462) non protegge la deregistrazione:
+    agent.terminate() e registry.deregister(...) sono due righe in sequenza senza
+    finally, quindi se terminate() lancia l'agente resta registrato. - F1
+    AraRuntime stesso tratta destroyPermanently come un metodo che puo' lanciare:
+    591-596 lo chiama dentro try/finally con il commento "Always clean up instance
+    context, even if destroyPermanently throws". Il chiamante si protegge, il
+    metodo no. L'agente distrutto resta indirizzabile via findById, e la
+    creazione successiva con lo stesso agentId fallisce con IllegalArgumentException
+    "Agent with id [...] is already registered" (AgentRegistry 54-63), un messaggio
+    che non nomina la causa reale ne' l'agente che l'ha causata.
+
+  [correttezza] close() (169-175) chiude i due registri ma non lascia alcuno stato
+    che impedisca di creare un agente dopo: create() e replace() non controllano
+    transportsAreClosed(), che e' l'unico predicato che lo saprebbe dire. - D2, E6
+    close() spegne solo lo scheduler di drain (DefaultResourceRegistry.close
+    343-347 e' uno shutdownNow), quindi un agent creato dopo close registra
+    normalmente, prende il lease del transport e non avra' mai piu' un drain
+    programmato: una versione ritirata resta con ref-count > 0 per sempre e la
+    connessione non viene piu' chiusa. Il javadoc di close (163-167) promette
+    solo che e' sicuro chiamarlo piu' volte, non cosa succede se si continua a creare.
+
+  [leggibilita] Il javadoc di classe (186-189) promette che "All other collaborators
+    (LlmClient, ToolRegistry) are shared among all instances because they are
+    stateless and thread-safe": il ToolRegistry NON e' condiviso quando si usa
+    toolRegistryFactory, perche' buildInstance (305) lo applica una volta per
+    agente, e l'LlmClient non e' piu' condiviso affatto, e' leased per sessione da
+    una versioned registry, come dice il javadoc dello stesso metodo (295-302).
+    Correggere il contratto di classe. - C5, H1
+    E' una promessa che il file stesso smentisce due volte: il costruttore chiama
+    toolRegistryFactory.apply(config) per ogni create (305) e il doc di
+    buildInstance (296-301) spiega che e' una volta per agente. La frase e'
+    sopravvissuta all'introduzione del registry dei transport, che ha reso falso
+    anche il pezzo su LlmClient: un lettore che segue il consiglio di 55-60
+    ("toolRegistryFactory ... as done in AraPlatformFactory") e si aspetta un
+    registry condiviso costruisce un agente con un registry per agente e non lo sa.
+
+  [semplificazione] create(AgentConfig) (194-211) e replace(AgentConfig) (255-270)
+    sono lo stesso metodo con due righe diverse: Objects.requireNonNull, la
+    ricorsione su knowledgeBaseContract, instrumentTracing(buildInstance(config)),
+    la chiamata al registry e il log. Idem create(config, contract) (227-237) e
+    replace(config, contract) (281-292). Estrarre un unico percorso di
+    costruzione (buildAndWrap) + una sola operazione di registry, con replace che
+    passa da registry.replace a register. - A3, B1
+    Il file ha gia' tre helper condivisi (buildInstance, buildAndWrap,
+    knowledgeBaseContract): manca solo l'ultimo pezzo, la ricorsione del contratto
+    KB e la scelta register/replace. Le quattro varianti pubbliche non sono un
+    caso reale: AraRuntime le chiama una volta ciascuna (189, 321, 443, 458) e non
+    c'e' nessun altro call site di create/replace in tutto il repo (grep su
+    main). Sono quattro overload che potrebbero essere due, o uno solo con un
+    parametro.
+
+  [leggibilita] Nomi di tipo per intero nel corpo e nei campi: io.ara.core.trace.
+    TraceStore e io.ara.core.trace.BlobStore (100-101, 496-497),
+    io.ara.runtime.trace.TraceEmittingAgent (351) e
+    io.ara.core.trace.TraceStore/BlobStore nei parametri di traceEmission
+    (641-642). Importarli come gli altri 28 tipi del file. - B3, G2
+    ContractEnforcingAgent, che e' lo stesso pattern (un decorator che avvolge
+    l'agente appena costruito, 340), e' importato e usato come nome semplice:
+    quindi il per-corso-intero di TraceEmittingAgent e' un residuo, non una
+    scelta, e il lettore non ha modo di saperlo.
+
+  [leggibilita] Il javadoc di classe (55-60) rimanda a AraPlatformFactory come
+    esempio di uso diretto di AgentFactory, ma quella classe non esiste in questo
+    repo: un find su *Platform* non trova nulla e l'unico altro riferimento
+    (LlmClientFactory 8) la dice "inside ara-server", che non e' un modulo di
+    questo checkout. - H1, H2
+    Il punto della sezione ("when to use AgentFactory directly vs AraRuntime") e'
+    valido e si regge da solo nella frase precedente, quindi il rimando non
+    aggiunge informazione: aggiunge solo un indirizzo che il lettore non puo'
+    aprire. Se la regola vale perche' la factory diretta serve, sta nella frase
+    sul toolRegistryFactory custom; se vale perche' qualcuno in ara-server lo fa,
+    allora va detto perche' conta, non citato.
+
+  [semplificazione] Il predicato della knowledge base (318-320) ripete la
+    condizione che KnowledgeBasePromptShaper.shape (24-29) rivalida da capo:
+    knowledgeBaseId non vuota E "search_documents" fra gli enabledTools. La
+    factory controlla per decidere se costruire il contratto, lo shaper
+    ricontrolla per decidere se riscrivere il prompt, con la stringa
+    "search_documents" hard-coded in due punti (320 qui, 27 e 32-36 nello shaper).
+    Esporre un metodo statico di gate tipo KnowledgeBasePromptShaper.appliesTo
+    (config) e usarlo nei due punti, cosi' la condizione vive una volta sola. - A3, B2
+    Oggi una sola delle due copie deve cambiare perche' il factory smetta di
+    aggiungere lo shaper, oppure perche' lo shaper smetta di riscrivere il prompt:
+    in entrambi i casi l'agente perde la knowledge base senza errore e senza
+    log, perche' il fallimento e' "nessun prompt shaper applicato", che e'
+    indistinguibile da "agente senza knowledge base" dal punto di vista del
+    chiamante. E' il caso classico di B2: la duplicazione della stringa, non la
+    logica, e' la cosa che va cambiata.
+
+  Nota di non-duplicazione: le 11 occorrenze "ADR-039"/"ADR-0068" di questo file
+  sono esclusioni, non rilievi: verificata una per una, tutte hanno gia' la
+  spiegazione per iscritto accanto al tag (es. 95-98 e 636-639 per ADR-0068,
+  104-110 per il registry dei transport), quindi rispettano la parte "il tag e'
+  solo in aggiunta" di H2. Non le ripropongo: la voce 6 ha gia' segnalato i casi
+  in cui il tag e' invece il soggetto della frase. E non ripropongo nulla su
+  SessionManager ne su DefaultResourceRegistry, gia' coperte dalle voci 5 e 6
+  (close sotto lock, attese non bounded, fan-out senza tetto).
+
+  Nota di onesta' (D3): analisi fatta per lettura e grep su ARA, non ho eseguito
+  mvn verify ne i test, quindi i difetti di runtime qui sopra sono dedotti dal
+  codice e vanno confermati. I due che scriverei per primi, perche' si
+  riproducono in poche righe con gli stub gia' presenti in ara-runtime: il
+  defaultLlmClientId non risolvibile (costruire la factory con
+  defaultLlmClient("inesistente") e osservare il messaggio alla prima sessione)
+  e il destroyPermanently che non deregistra (un AraAgent finto il cui terminate
+  lancia, e verificare che findById continua a trovarlo).
+
+# ---------------------------------------------------------------------------
 # Analizzate ma NON registrate (candidati di riserva)
 # ---------------------------------------------------------------------------
 # io.ara.runtime.pipeline.AgentPipeline (661) - nessun timeout sul percorso di
