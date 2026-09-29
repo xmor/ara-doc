@@ -885,6 +885,130 @@ io.ara.runtime.factory.AgentFactory
   lancia, e verificare che findById continua a trovarlo).
 
 # ---------------------------------------------------------------------------
+# 9
+# ---------------------------------------------------------------------------
+io.ara.runtime.strategy.ReflexionStrategy
+  ara-runtime/src/main/java/io/ara/runtime/strategy/ReflexionStrategy.java (341 righe)
+
+  Scelta: nessuna occorrenza nel registro, ne' fra le voci 1-8 ne' nella sezione
+  candidati di riserva. E' il terzo strategia della famiglia ReAct-shaped dopo
+  PlanExecuteStrategy (voce 1) e ReactExecutionSupport (voce 2), quindi la stessa
+  forma di codice gia' due volte analizzata: qui la diverge in un punto che le altre
+  due risolvono - il budget.
+
+  [correttezza] Nessuna governance di costo: zero occorrenze di checkBudget e di
+    chargeRunBudget in tutto il file, mentre la chiamata LLM di riflessione
+    (295-301) accumula i token solo nei totali locali (207-208), che finiscono
+    nell'ExecutionResult ma non in nessun governore. Aggiungere checkBudget
+    prima della chiamata e chargeRunBudget dopo, come fa ReActLoop. - F2, D2
+    Il javadoc di chargeRunBudget (ReactExecutionSupport 998-1002) scrive esplicitamente
+    la regola che questo file viola: "one charge per LLM call - the reasoning call every
+    iteration makes, and each reflection call ReflActStrategy adds on top of it".
+    Quindi non e' una semplificazione auspicata: e' un contratto gia' scritto nel
+    helper condiviso, che il fratello ReflActStrategy onora (reflectAndCharge 219-228
+    chiama chargeRunBudget) e questo no.
+    L'impatto e' doppio e diverso dai due governori. Sul costBudget locale
+    (checkBudget) manca del tutto il controllo pre-chiamata, quindi una riflessione
+    puo' far superare il limite che ReActLoop rispetterebbe a ogni iterazione. Sul
+    RunBudget gerarchico manca la charge, quindi il task che gira dentro un workflow
+    ne' segnala lo sforzo delle N riflessioni: con maxReflections=3 il delegate
+    ReAct viene contabilizzato 4 volte ma le 3 chiamate di riflessione sono
+    invisibili al budget del genitore.
+
+  [correttezza] Il contratto di cancellazione dichiarato a 174-176 ("Abort
+    immediately - do NOT generate a reflection or retry") non e' rispettato quando
+    l'interrupt arriva dentro la chiamata di riflessione: generateReflection lo
+    intercetta a 302-305, ripristina il flag e restituisce una Reflection di
+    fallback, quindi execute la registra (214), risemina la memoria (217-230) e
+    rilancia un delegate.execute COMPLETO (169) prima che il controllo
+    isInterrupted() a 177 la veda. - E5, F1
+    Il costo e' interamente sprecato: il commento promette un abort immediato e il
+    codice esegue un giro in piu' dell'intero ciclo ReAct del delegate, cioe' N
+    iterazioni con N chiamate LLM e le relative tool call, su un task che il
+    chiamante ha gia' cancellato. Il risultato finale e' comunque "Cancelled" a 179,
+    quindi il difetto non si vede dall'esito: si vede solo in latenza e in spesa.
+    Rimedio minimo, una riga: ricontrollare Thread.currentThread().isInterrupted()
+    subito dopo la generateReflection e prima del riseminamento, riutilizzando la
+    stessa ExecutionResult.failure("Cancelled", ...) gia' costruita a 179. Il
+    riflesso del problema e' che il commento a 174-176 descrive l'invariante
+    correttamente ma lo ascrive al punto di controllo sbagliato: descrive il
+    controllo che sta a 177 quando il caso che descrive nasce a 302.
+
+  [leggibilita] execute() e' a 114 righe (122-235), sopra la soglia di split
+    obbligatoria di ~80. La separazione naturale e' gia' segnata dalle righe vuote:
+    il blocco di riseminamento della memoria (216-230) e' 14 righe e non tocca
+    nulla fuori dai suoi argomenti, quindi diventa
+    reseedWorkingMemory(memory, systemPrompt, recalledCtx, priorReflections,
+    task.input()) senza cambiare comportamento. - G1, B1
+    I tre totali (151-152, accumulati a 170-172 e 207-208) sono il secondo
+    candidato: sono un contatore a tre campi trascinato come tre variabili locali
+    mutabili lungo tutto il loop, che e' esattamente cio' che E4 chiede di
+    sostituire con dati immutabili. Un record mutable-minimo o un Tally come
+    usato dalla voce 1 eliminerebbe anche il rischio di dimenticare uno dei tre
+    in un ramo futuro.
+
+  [leggibilita] generateReflection ha 9 parametri (264-273), contro la soglia di
+    "oltre 3-4 e' un odore" di G1. Cinque di questi non cambiano mai fra una
+    chiamata e l'altra (task, llm, ctx, config, deadline): sono costanti del loop
+    che vengono ripassate a ogni tentativo. Piegarli in un record costruito una
+    volta sola in execute riporta il metodo a 4 parametri. - G1, A3
+    Nota di non-duplicazione: e' lo stesso difetto che la voce 1 segnala su
+    PlanExecuteStrategy (il record Run aggiunto ai parametri invece di sostituirli)
+    e lo segnala gia' come "piegare plan e stepResults dentro Run le porta a 3".
+    Qui la forma e' diversa: non c'e' nessun record preesistente da piegare, quindi
+    la proposta non si appoggia a quello e non ripete il rimedio, segnala solo
+    che la soglia e' stata superata di due volte e non di una.
+
+  [leggibilita] Il log.debug a 209-212 costruisce la troncatura dei 200 caratteri
+    e la concatena a "..." PRIMA di entrare nella chiamata, quindi substring e
+    concatenazione vengono eseguite a ogni tentativo anche con DEBUG disattivato.
+    F3 chiede di presidiare i body che allocano con isDebugEnabled(); qui si puo'
+    spostare il ternario dentro il ramo if, dal momento che i log.debug a 166 e
+    183 sono gia' parametrati e senza allocazione. - F3
+    E' l'unico caso del file: gli altri tre log.debug sono forme parametriate senza
+    corpo che alloca, quindi il refuso e' localizzato e non un problema di stile
+    diffuso.
+
+  [leggibilita] Il parametro si chiama e a 336 (extractRecalledContext), dove
+    "e" e' una entry di memoria e non un'eccezione: il nome e' la scelta piu'
+    naturale in un contesto di stream, ma in questo file non c'e' nessun'altra
+    "e" che sia un'eccezione, quindi rinominarlo in entry o memoryEntry non costa
+    nulla e allinea il file alla regola G2. - G2, B4
+
+  [leggibilita] Il file spiega il perche' di quasi tutto (154-160 il deadline
+    condiviso, 174-176 la cancellazione, 204-208 il conteggio dei token, 222 la
+    scelta di iniettare tutte le riflessioni come blocco system) ma non contiene
+    NESSUNA alternativa scartata, mentre C1 e' la categoria che le linee guida
+    dichiarano di maggior valore. La domanda che un reviewer porra' per prima su
+    questo file e' "perche' riflettere e riprovare invece di rilanciare da capo
+    con lo stesso contesto", e la risposta non e' scritta da nessuna parte. - C1, D1
+    E' la voce piu' economica da sistemare di tutta la lista: non richiede di
+    toccare codice, solo di scrivere le 15 righe di design comment che mancano
+    all'inizio del file, accanto ai tre esempi di quick start che ci sono gia'.
+
+  [leggibilita] Manca un commento di checklist (C4) sul nodo fragile fra questo
+    file e i suoi vicini: la chiave DEFAULT_REFLECTION_PROMPT e il marcatore
+    "Reflection:" che chiude il prompt (71) devono restare allineati a come
+    ReflActStrategy e ReSpActStrategy estraggono il testo dalle risposte del
+    modello. Se uno dei due cambia senza l'altro, l'estrazione semplicemente
+    smette di funzionare e fallisce in silenzio. - C4
+
+  Nota di onesta' (D3): analisi fatta per lettura e grep su ARA, non ho eseguito
+  mvn verify ne la suite di test, quindi i difetti di runtime qui sopra sono
+  dedotti dal codice e vanno confermati. Il primo che scriverei e' il difetto di
+  governance: si verifica con uno StubAgent che configuri un costBudget basso e un
+  delegate che fallisca sempre, contando quante volte viene chiamato. Il secondo,
+  il giro extra dopo la cancellazione, si verifica con un delegate finto che
+  conti le invocazioni e un thread interrotto mentre e' in corso la riflessione.
+  Nota di non-duplicazione: nessuno dei rilievi sopra ripete una voce 1-8. La
+  famiglia ReAct e' gia' coperta per execute() troppo lunghi (voce 1), assenza di
+  budget in plan_execute (voce 1), copia del blocco LLM+interrotto (voce 1) e per
+  la copertura dei support (voce 2). Qui il difetto di budget e' su una classe
+  diversa e con un caso diverso: non manca del tutto come in plan_execute, esiste
+  nel fratello ReflActStrategy ed e' gia' scritto come contratto nel javadoc
+  dell'helper, quindi il rimedio e' copiare, non progettare.
+
+# ---------------------------------------------------------------------------
 # Analizzate ma NON registrate (candidati di riserva)
 # ---------------------------------------------------------------------------
 # io.ara.runtime.pipeline.AgentPipeline (661) - nessun timeout sul percorso di
