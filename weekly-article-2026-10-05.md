@@ -1,39 +1,43 @@
-# `FailoverLlmClient`: la catena di generatori di riserva
+# `FailoverLlmClient`: The Fallback Generator Chain
 
-## 1. Dov'è, a cosa serve, chi la usa
+## 1. Where it lives, what it does, and who uses it
 
-In ARA ogni volta che un agente "pensa" passa da **`LlmClient`**, l'interfaccia verso il modello (OpenAI, Claude, Ollama…). In produzione, però, un modello può cadere: un timeout, un 5xx, un limite di richieste. **`FailoverLlmClient`** (`ara-runtime`, package `io.ara.runtime.factory`) è il decoratore che mette più client **in fila per priorità**: prova il primo e, se non risponde, passa al successivo, senza che l'agente se ne accorga.
+In ARA, whenever an agent “thinks,” it goes through **`LlmClient`**, the interface to the underlying model (OpenAI, Claude, Ollama, and so on). In production, however, a model can fail: a timeout, a 5xx response, or a rate limit. **`FailoverLlmClient`** (`ara-runtime`, package `io.ara.runtime.factory`) is the decorator that arranges multiple clients **in priority order**: it tries the first and, if it fails to respond, moves on to the next, without the agent ever noticing.
 
-**Chi la usa?** Nessuno la chiama a mano. La costruisce `DefaultLlmRouter` da solo, quando l'agente dichiara `LlmSelectionPolicy.FAILOVER` e una lista di `fallbackLlms(...)`. Poi le strategie di esecuzione (`ReactStrategy` e sorelle) la interrogano come se fosse **un unico modello**, chiamando `complete()` o `stream()`.
+**Who uses it?** Nobody calls it manually. `DefaultLlmRouter` creates it automatically when an agent declares `LlmSelectionPolicy.FAILOVER` and a list of `fallbackLlms(...)`. The execution strategies (`ReactStrategy` and its counterparts) then interact with it as if it were **a single model**, calling `complete()` or `stream()`.
 
-**Perché serve?** Perché "il modello è giù" non deve mai essere un errore mostrato all'utente: è un caso previsto.
+**Why is it needed?** Because “the model is down” should never be an error shown to the user: it is an anticipated failure scenario.
 
-## 2. Una metafora per tenere il filo
+## 2. An analogy to keep things clear
 
-Una **batteria di generatori di un ospedale**. Davanti c'è la rete elettrica (il modello principale) e, dietro, generatori numerati. Al primo blackout parte il generatore 1; se anche quello non regge, il 2. Il centralino annota **quale sorgente sta alimentando la sala**, così chi indaga sa chi ha tenuto. E una regola ferrea: se la luce salta **a operazione iniziata**, non si ricomincia l'intervento dall'inizio — si accetta l'interruzione, perché riavviare significherebbe rifare tutto ciò che è già stato fatto.
+Think of **a hospital's backup generators**. The primary power supply is the electrical grid (the main model), with numbered generators waiting in reserve. When the first blackout occurs, generator 1 kicks in; if that one fails too, generator 2 takes over. The control room records **which power source is supplying the operating room**, so anyone investigating the incident can identify what kept it running.
 
-## 3. Il flusso: cosa entra, cosa succede, cosa esce
+And there is one hard-and-fast rule: if the power fails **after an operation has already started**, you do not restart the surgery from scratch. You accept the interruption, because restarting would mean repeating everything that has already been done.
 
-**Input.** I messaggi e le opzioni della chiamata (`LlmCallContext`), più la lista di client già **in ordine di priorità**.
+## 3. The flow: what goes in, what happens, and what comes out
 
-**Processo.** `complete()` li prova uno dopo l'altro. Un errore **deterministico** (401, richiesta non valida) ferma subito la catena; un errore **ritentabile altrove** (rete, 5xx, rate limit) fa passare al candidato successivo. Dopo ogni fallimento controlla se il thread è stato **interrotto** (scadenza superata) e, in tal caso, si ferma invece di proseguire. Sul percorso in streaming (`stream()`) la regola si stringe: si può cambiare fornitore **solo prima del primo token**.
+**Input.** The messages and call options (`LlmCallContext`), together with the list of clients already **ordered by priority**.
 
-**Output.** Il `LlmCompletion` del primo che risponde, oppure l'ultima eccezione. In più, con la telemetria attiva, uno span `llm.failover` che dice com'è finita: `served_by_primary`, `served_by_fallback`, `aborted_non_failover`, `exhausted` o `interrupted`.
+**Process.** `complete()` tries them one after another. A **non-retryable** error (401, invalid request) immediately stops the chain; an error **worth failing over on** (network failure, 5xx, rate limit) moves execution to the next candidate. After each failure, it checks whether the thread has been **interrupted** (the deadline has expired) and, if so, stops rather than proceeding.
 
-## 4. Le scelte, e i perché
+The rule is stricter for streaming (`stream()`): the provider can be switched **only before the first token is emitted**.
 
-**"Ritentare qui" ≠ "provare altrove".** Il pool non guarda `isRetryable()` ma un flag separato, `shouldFailover()`: un errore di connessione non va riprovato sullo *stesso* endpoint, ma la catena deve poter avanzare su un *altro*. Sono due domande diverse, e meritano due risposte diverse.
+**Output.** The `LlmCompletion` returned by the first successful candidate, or the last exception. In addition, when telemetry is enabled, an `llm.failover` span records the outcome: `served_by_primary`, `served_by_fallback`, `aborted_non_failover`, `exhausted`, or `interrupted`.
 
-**Un 401 non si moltiplica.** Davanti a un errore che si ripeterebbe identico su ogni candidato, la catena si ferma: cambiare modello non cambierebbe l'esito, solo il rumore nei log.
+## 4. The design decisions and why they matter
 
-**Niente doppioni in streaming.** Una volta emesso il primo token, passare al fornitore successivo riscriverebbe da capo ciò che l'utente ha già visto. Meglio un fallimento pulito che un testo ripetuto.
+**“Retry here” is not the same as “try elsewhere.”** The pool does not rely on `isRetryable()`, but on a separate flag, `shouldFailover()`. A connection error should not be retried against the *same* endpoint, but the chain must be able to move on to *another* one. These are two distinct questions and deserve two distinct answers.
 
-**La scadenza non si amplifica.** Ogni candidato ha il proprio timeout: senza il controllo sull'interruzione, un watchdog scaduto farebbe pagare l'attesa a *tutti* i candidati rimasti. Interrompere il filo ferma la catena al primo colpo.
+**A 401 does not multiply.** When an error would recur identically across every candidate, the chain stops immediately. Switching models would not change the outcome; it would only add noise to the logs.
 
-**Si promette solo ciò che tutti mantengono.** `supportedMediaTypes()` e `supportsNativeTools()` valgono `true` solo se *ogni* candidato li supporta: altrimenti un ripiego solo-testo risponderebbe su un PDF che non ha mai ricevuto. Meglio un errore immediato, dal primo candidato, che una risposta sbagliata e silenziosa.
+**No duplicate output during streaming.** Once the first token has been emitted, switching to another provider would mean regenerating content the user has already seen. A clean failure is better than duplicated text.
 
-**Perché un decoratore, e non dentro le strategie.** Tenendo la resilienza separata dall'intelligenza, l'agente resta semplice e le capacità si **compongono**: aggiungere un `CircuitBreakerLlmClient`, un nuovo fornitore o una chain diversa è una questione di *configurazione*, non di codice dell'agente.
+**Deadlines are not multiplied.** Each candidate has its own timeout. Without interruption checks, an expired watchdog could force the caller to wait for *every* remaining candidate. Interrupting the thread stops the chain immediately.
+
+**Only promise what every candidate can deliver.** `supportedMediaTypes()` and `supportsNativeTools()` return `true` only if *every* candidate supports the corresponding capability. Otherwise, a text-only fallback might respond to a PDF request without ever having received the document. An immediate failure from the first candidate is better than a silently incorrect response.
+
+**Why a decorator instead of embedding this logic in the strategies?** By keeping resilience separate from intelligence, the agent remains simple and capabilities can be **composed**. Adding a `CircuitBreakerLlmClient`, a new provider, or a different chain becomes a matter of *configuration*, not changes to the agent's code.
 
 ---
 
-*Classe: `io.ara.runtime.factory.FailoverLlmClient` — `ara-runtime`. Attivazione: `LlmSelectionPolicy.FAILOVER` + `fallbackLlms(...)`.*
+*Class: `io.ara.runtime.factory.FailoverLlmClient` — `ara-runtime`. Activation: `LlmSelectionPolicy.FAILOVER` + `fallbackLlms(...)`.*
